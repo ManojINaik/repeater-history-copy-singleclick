@@ -3,6 +3,9 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
+import burp.api.montoya.ui.hotkey.HotKeyContext;
+import burp.api.montoya.ui.hotkey.HotKeyEvent;
+import burp.api.montoya.ui.hotkey.HotKeyHandler;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -10,18 +13,18 @@ import burp.api.montoya.http.message.responses.HttpResponse;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.util.ArrayList;
+import java.util.*;
 import java.util.List;
-import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Extension implements BurpExtension {
     private MontoyaApi api;
-    private List<HttpRequestResponse> repeaterHistory;
+    private Map<String, List<HttpRequestResponse>> tabHistory;
 
     @Override
     public void initialize(MontoyaApi montoyaApi) {
         this.api = montoyaApi;
-        this.repeaterHistory = new ArrayList<>();
+        this.tabHistory = new ConcurrentHashMap<>();
 
         // Set extension name
         api.extension().setName("Repeater History Copy");
@@ -32,20 +35,25 @@ public class Extension implements BurpExtension {
         // Register HTTP handler to capture Repeater requests/responses
         api.http().registerHttpHandler(new RepeaterHttpHandler());
 
+        // Register hotkey Ctrl+Alt+C for copying tab history
+        api.userInterface().registerHotKeyHandler(
+            HotKeyContext.HTTP_MESSAGE_EDITOR,
+            "ctrl alt C",
+            new TabHistoryHotKeyHandler()
+        );
+
         api.logging().logToOutput("Repeater History Copy extension loaded successfully");
+        api.logging().logToOutput("Hotkey registered: Ctrl+Alt+C to copy tab history");
     }
 
     /**
-     * HTTP Handler to capture Repeater traffic
+     * HTTP Handler to capture Repeater traffic per tab
      */
     private class RepeaterHttpHandler implements burp.api.montoya.http.handler.HttpHandler {
         @Override
         public burp.api.montoya.http.handler.RequestToBeSentAction handleHttpRequestToBeSent(
                 burp.api.montoya.http.handler.HttpRequestToBeSent requestToBeSent) {
-            // Capture requests sent from Repeater
-            if (requestToBeSent.toolSource().isFromTool(burp.api.montoya.core.ToolType.REPEATER)) {
-                // We'll store this when we get the response
-            }
+            // We'll capture when we get the response
             return burp.api.montoya.http.handler.RequestToBeSentAction.continueWith(requestToBeSent);
         }
 
@@ -54,19 +62,32 @@ public class Extension implements BurpExtension {
                 burp.api.montoya.http.handler.HttpResponseReceived responseReceived) {
             // Capture request/response pairs from Repeater
             if (responseReceived.toolSource().isFromTool(burp.api.montoya.core.ToolType.REPEATER)) {
-                synchronized (repeaterHistory) {
-                    repeaterHistory.add(HttpRequestResponse.httpRequestResponse(
-                        responseReceived.initiatingRequest(),
-                        responseReceived
-                    ));
-                }
+                // Use the target URL as the tab identifier
+                String tabKey = getTabKey(responseReceived.initiatingRequest());
+
+                HttpRequestResponse reqResp = HttpRequestResponse.httpRequestResponse(
+                    responseReceived.initiatingRequest(),
+                    responseReceived
+                );
+
+                List<HttpRequestResponse> history = tabHistory.computeIfAbsent(tabKey, k -> Collections.synchronizedList(new ArrayList<>()));
+                history.add(reqResp);
+
+                api.logging().logToOutput(">>> CAPTURED request to tab: " + tabKey + " | Total entries in this tab: " + history.size());
             }
             return burp.api.montoya.http.handler.ResponseReceivedAction.continueWith(responseReceived);
         }
     }
 
     /**
-     * Context menu provider that adds "Copy All Repeater History" option
+     * Generates a unique key for a Repeater tab based on the request URL
+     */
+    private String getTabKey(HttpRequest request) {
+        return request.httpService().host() + ":" + request.httpService().port();
+    }
+
+    /**
+     * Context menu provider that adds "Copy Repeater Tab History" options
      */
     private class RepeaterHistoryContextMenuProvider implements ContextMenuItemsProvider {
         @Override
@@ -80,12 +101,85 @@ public class Extension implements BurpExtension {
                 copyCurrentItem.addActionListener(e -> copyCurrentRequestResponse(event));
                 menuItems.add(copyCurrentItem);
 
-                JMenuItem copyAllHistory = new JMenuItem("Copy All Captured History");
-                copyAllHistory.addActionListener(e -> copyRepeaterHistory(event));
-                menuItems.add(copyAllHistory);
+                JMenuItem copyTabHistory = new JMenuItem("Copy This Tab's History");
+                copyTabHistory.addActionListener(e -> copyCurrentTabHistory(event));
+                menuItems.add(copyTabHistory);
             }
 
             return menuItems;
+        }
+    }
+
+    /**
+     * Hotkey handler for Ctrl+Alt+C to copy tab history
+     */
+    private class TabHistoryHotKeyHandler implements HotKeyHandler {
+        @Override
+        public void handle(HotKeyEvent event) {
+            api.logging().logToOutput("=== HOTKEY CTRL+ALT+C TRIGGERED ===");
+
+            try {
+                // Get the current request/response from the message editor
+                Optional<MessageEditorHttpRequestResponse> messageEditor = event.messageEditorRequestResponse();
+                if (messageEditor.isEmpty() || messageEditor.get().requestResponse() == null) {
+                    api.logging().logToOutput("Hotkey triggered but no request/response data available");
+                    showNotification("No request/response data available");
+                    return;
+                }
+
+                HttpRequest currentRequest = messageEditor.get().requestResponse().request();
+                if (currentRequest == null) {
+                    api.logging().logToOutput("Hotkey triggered but no request data available");
+                    showNotification("No request data available");
+                    return;
+                }
+
+                // Get the tab key for the current tab
+                String tabKey = getTabKey(currentRequest);
+                api.logging().logToOutput("Identified tab key: " + tabKey);
+
+                // Get history for this specific tab
+                List<HttpRequestResponse> history = tabHistory.get(tabKey);
+
+                if (history == null) {
+                    api.logging().logToOutput("History is NULL for tab: " + tabKey);
+                    api.logging().logToOutput("All tab keys in history: " + tabHistory.keySet());
+                } else {
+                    api.logging().logToOutput("History size for tab " + tabKey + ": " + history.size());
+                }
+
+                if (history == null || history.isEmpty()) {
+                    api.logging().logToOutput("Hotkey triggered - No captured history for tab: " + tabKey);
+                    showNotification("No captured history for this tab.\n\nTab: " + tabKey + "\n\nThis extension captures requests sent AFTER it was loaded.\n\nSend some requests in Repeater first!");
+                    return;
+                }
+
+                // Create a copy to avoid concurrent modification
+                List<HttpRequestResponse> historyCopy;
+                synchronized (history) {
+                    historyCopy = new ArrayList<>(history);
+                }
+
+                api.logging().logToOutput("About to format " + historyCopy.size() + " history entries");
+
+                // Format the history
+                String formattedHistory = formatHistory(historyCopy, tabKey);
+
+                api.logging().logToOutput("Formatted history length: " + formattedHistory.length() + " characters");
+                api.logging().logToOutput("First 200 chars: " + formattedHistory.substring(0, Math.min(200, formattedHistory.length())));
+
+                // Copy to clipboard
+                copyToClipboard(formattedHistory);
+
+                api.logging().logToOutput("Hotkey: Successfully copied " + historyCopy.size() + " history entries from tab: " + tabKey);
+                api.logging().logToOutput("=== HOTKEY COPY COMPLETE ===");
+                showNotification("✓ Copied " + historyCopy.size() + " HISTORY ENTRIES from this tab\n\nTab: " + tabKey + "\n\nUsing hotkey: Ctrl+Alt+C");
+
+            } catch (Exception e) {
+                api.logging().logToError("Error handling hotkey: " + e.getMessage());
+                e.printStackTrace();
+                showNotification("Error copying tab history: " + e.getMessage());
+            }
         }
     }
 
@@ -124,34 +218,54 @@ public class Extension implements BurpExtension {
     }
 
     /**
-     * Retrieves and copies all captured Repeater history to clipboard
+     * Retrieves and copies history from the current Repeater tab to clipboard
      */
-    private void copyRepeaterHistory(ContextMenuEvent event) {
+    private void copyCurrentTabHistory(ContextMenuEvent event) {
         try {
-            List<HttpRequestResponse> history;
-            synchronized (repeaterHistory) {
-                history = new ArrayList<>(repeaterHistory);
-            }
-
-            if (history.isEmpty()) {
-                api.logging().logToOutput("No captured Repeater history found");
-                showNotification("No captured history available.\n\nThis extension captures requests sent AFTER it was loaded.\nUse 'Copy Current Request/Response' to copy what's visible now.");
+            // Get the current request to identify which tab we're in
+            Optional<MessageEditorHttpRequestResponse> messageEditor = event.messageEditorRequestResponse();
+            if (messageEditor.isEmpty() || messageEditor.get().requestResponse() == null) {
+                showNotification("No request data available to identify tab");
                 return;
             }
 
+            HttpRequest currentRequest = messageEditor.get().requestResponse().request();
+            if (currentRequest == null) {
+                showNotification("No request data available to identify tab");
+                return;
+            }
+
+            // Get the tab key for the current tab
+            String tabKey = getTabKey(currentRequest);
+
+            // Get history for this specific tab
+            List<HttpRequestResponse> history = tabHistory.get(tabKey);
+
+            if (history == null || history.isEmpty()) {
+                api.logging().logToOutput("No captured history for this tab: " + tabKey);
+                showNotification("No captured history for this tab.\n\nTab: " + tabKey + "\n\nThis extension captures requests sent AFTER it was loaded.\nUse 'Copy Current Request/Response' to copy what's visible now.");
+                return;
+            }
+
+            // Create a copy to avoid concurrent modification
+            List<HttpRequestResponse> historyCopy;
+            synchronized (history) {
+                historyCopy = new ArrayList<>(history);
+            }
+
             // Format the history
-            String formattedHistory = formatHistory(history);
+            String formattedHistory = formatHistory(historyCopy, tabKey);
 
             // Copy to clipboard
             copyToClipboard(formattedHistory);
 
-            api.logging().logToOutput("Successfully copied " + history.size() + " captured history entries to clipboard");
-            showNotification("Copied " + history.size() + " captured history entries to clipboard");
+            api.logging().logToOutput("Successfully copied " + historyCopy.size() + " history entries from tab: " + tabKey);
+            showNotification("Copied " + historyCopy.size() + " history entries from this tab\n(" + tabKey + ")");
 
         } catch (Exception e) {
-            api.logging().logToError("Error copying Repeater history: " + e.getMessage());
+            api.logging().logToError("Error copying tab history: " + e.getMessage());
             e.printStackTrace();
-            showNotification("Error copying history: " + e.getMessage());
+            showNotification("Error copying tab history: " + e.getMessage());
         }
     }
 
@@ -193,14 +307,15 @@ public class Extension implements BurpExtension {
     }
 
     /**
-     * Formats the history entries into a readable string
+     * Formats the history entries into a readable string with tab information
      */
-    private String formatHistory(List<HttpRequestResponse> history) {
+    private String formatHistory(List<HttpRequestResponse> history, String tabKey) {
         StringBuilder sb = new StringBuilder();
         String separator = "=".repeat(80);
 
-        sb.append("BURP REPEATER HISTORY\n");
+        sb.append("BURP REPEATER TAB HISTORY\n");
         sb.append(separator).append("\n");
+        sb.append("Tab: ").append(tabKey).append("\n");
         sb.append("Total Entries: ").append(history.size()).append("\n");
         sb.append(separator).append("\n\n");
 
