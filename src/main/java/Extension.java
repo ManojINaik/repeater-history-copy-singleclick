@@ -81,9 +81,12 @@ public class Extension implements BurpExtension {
 
     /**
      * Generates a unique key for a Repeater tab based on the request URL
+     * Includes host, port, and path to distinguish between different tabs
      */
     private String getTabKey(HttpRequest request) {
-        return request.httpService().host() + ":" + request.httpService().port();
+        return request.httpService().host() + ":" +
+               request.httpService().port() + ":" +
+               request.path();
     }
 
     /**
